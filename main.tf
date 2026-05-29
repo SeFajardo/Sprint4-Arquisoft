@@ -45,7 +45,7 @@ resource "aws_security_group" "kong" {
     to_port     = 8000
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "JMeter -> Kong proxy"
+    description = "JMeter to Kong proxy"
   }
 
   ingress {
@@ -76,7 +76,7 @@ resource "aws_security_group" "api" {
     to_port         = 8080
     protocol        = "tcp"
     security_groups = [aws_security_group.kong.id]
-    description     = "Kong -> API"
+    description     = "Kong to API"
   }
 
   ingress {
@@ -107,7 +107,7 @@ resource "aws_security_group" "db" {
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.api.id]
-    description     = "API -> DB"
+    description     = "API to DB"
   }
 
   ingress {
@@ -138,7 +138,7 @@ resource "aws_security_group" "mongo" {
     to_port         = 27017
     protocol        = "tcp"
     security_groups = [aws_security_group.api.id]
-    description     = "API -> MongoDB"
+    description     = "API to MongoDB"
   }
 
   ingress {
