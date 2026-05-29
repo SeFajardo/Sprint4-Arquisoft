@@ -3,6 +3,8 @@ set -e
 
 sleep 30
 
+yum install -y git
+
 mkdir -p /labs
 cd /labs
 git clone ${github_repo} sprint
