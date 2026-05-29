@@ -9,16 +9,24 @@ Experimento académico para validar dos ASRs sobre el endpoint de registro de cu
 ```
 [JMeter local] ──HTTP:8000──▶ [bite-kong EC2] ──HTTP:8080──▶ [bite-api EC2] ──TCP:5432──▶ [bite-db EC2]
                                Kong 3.6 (Docker)              Flask + Gunicorn              PostgreSQL 14
-                               Plugins:
-                               • key-auth        → 401 si sin apikey
-                               • rate-limiting   → 429 si >60 req/min
-                               • request-size-limiting → 413 si >2KB
-                               • file-log        → auditoría en /tmp/kong-audit.log
+                               Plugins:                                │                   (fuente de verdad ACID)
+                               • key-auth        → 401                │
+                               • rate-limiting   → 429 >2000/min      │──TCP:27017──▶ [bite-mongo EC2]
+                               • request-size-limiting → 413 >2KB                     MongoDB 7.0
+                               • file-log        → /tmp/kong-audit.log                • audit_events (ASR-SEG)
+                                                                                       • account_cache (ASR-LAT)
 ```
+
+**Táctica no-relacional aplicada — Polyglot Persistence:**
+| Rol de MongoDB | Colección | Táctica | ASR que soporta |
+|---------------|-----------|---------|-----------------|
+| Audit Event Store | `audit_events` | Documento JSON append-only, schema flexible | ASR-SEG: registro de cada evento de seguridad (401, 429, 400, SUCCESS) |
+| Account Cache | `account_cache` | Cache-aside + Write-through | ASR-LAT: check de duplicado vía índice MongoDB antes de ir a PostgreSQL |
 
 | EC2 | Nombre | Qué corre | Puerto |
 |-----|--------|-----------|--------|
 | bite-db | PostgreSQL 14 | `apt install postgresql` nativo | 5432 |
+| bite-mongo | MongoDB 7.0 | `apt install mongodb-org` nativo | 27017 |
 | bite-api | Flask + Gunicorn 4 workers | `gunicorn app:app` | 8080 |
 | bite-kong | Kong 3.6 | Docker (`kong:3.6`) | 8000 |
 
@@ -66,7 +74,7 @@ terraform init
 terraform apply -auto-approve
 ```
 
-Terraform creará en orden: 3 security groups + 3 EC2 (`bite-db` → `bite-api` → `bite-kong`).
+Terraform creará en orden: 4 security groups + 4 EC2 (`bite-db` y `bite-mongo` en paralelo → `bite-api` → `bite-kong`).
 
 `apply` termina en ~2 minutos. Pero los **user_data siguen corriendo** en background (instalan PostgreSQL, Python, Docker, etc.).
 
@@ -75,6 +83,9 @@ Terraform creará en orden: 3 security groups + 3 EC2 (`bite-db` → `bite-api` 
 ```bash
 # Ver log de la DB
 ssh -i ~/vockey.pem ubuntu@$(terraform output -raw db_public_ip) 'tail -f /tmp/user-data-db.log'
+
+# Ver log de MongoDB
+ssh -i ~/vockey.pem ubuntu@$(terraform output -raw mongo_public_ip) 'tail -f /tmp/user-data-mongo.log'
 
 # Ver log de la API (en otra terminal)
 ssh -i ~/vockey.pem ubuntu@$(terraform output -raw api_public_ip) 'tail -f /tmp/user-data-api.log'
@@ -197,10 +208,25 @@ Abrir `report/index.html` y verificar en el **Aggregate Report**:
 
 ## Paso 7 — Inspeccionar auditoría y logs
 
-### Audit log de la base de datos (registros internos)
+### Audit log de PostgreSQL (fuente de verdad relacional)
 ```bash
 ssh -i ~/vockey.pem ubuntu@$(terraform output -raw db_public_ip) \
   "PGPASSWORD=bite_app_pass_123 psql -U bite_app -d bite -c 'SELECT timestamp, source_ip, status, reason FROM audit_log ORDER BY timestamp DESC LIMIT 20;'"
+```
+
+### Audit events de MongoDB (Audit Event Store — ASR-SEG)
+```bash
+# Ver ultimos 20 eventos de seguridad en MongoDB
+ssh -i ~/vockey.pem ubuntu@$(terraform output -raw mongo_public_ip) \
+  'mongosh "mongodb://localhost:27017/bite_mongo" --eval "db.audit_events.find({},{_id:0,timestamp:1,source_ip:1,status:1,reason:1}).sort({timestamp:-1}).limit(20).forEach(printjson)"'
+
+# Contar eventos por status (401, 429, VALIDATION_FAILED, SUCCESS)
+ssh -i ~/vockey.pem ubuntu@$(terraform output -raw mongo_public_ip) \
+  'mongosh "mongodb://localhost:27017/bite_mongo" --eval "db.audit_events.aggregate([{\$group:{_id:\"\$status\",count:{\$sum:1}}}]).forEach(printjson)"'
+
+# Ver cuentas en cache (Account Cache — ASR-LAT)
+ssh -i ~/vockey.pem ubuntu@$(terraform output -raw mongo_public_ip) \
+  'mongosh "mongodb://localhost:27017/bite_mongo" --eval "db.account_cache.countDocuments()"'
 ```
 
 ### Log de auditoría de Kong (file-log plugin)
@@ -238,7 +264,9 @@ Esto elimina las 3 EC2 y los 3 security groups. **No hay costos recurrentes** un
 | PostgreSQL rechaza conexiones | pg_hba.conf no se aplicó | SSH a bite-db → `sudo -u postgres psql -c "SHOW hba_file;"` → revisar el archivo |
 | `terraform apply` falla con "InvalidAMIID" | AMI no disponible en us-east-1 | Buscar el AMI ID actual de Ubuntu 22.04 LTS en la consola de AWS y actualizar `main.tf` |
 | JMeter no encuentra `account_ids.csv` | Ruta incorrecta | El CSV debe estar en `jmeter/account_ids.csv` (mismo directorio que el .jmx) |
-| `rate-limiting` no genera 429 | Test muy corto o pocas threads | El límite es 60 req/min; el thread group 4 corre 5 threads sin timer, debe superarlo en segundos |
+| `rate-limiting` no genera 429 | Test muy corto o pocas threads | El límite es 2000 req/min; TG4 (5 threads sin timer) genera ~5000+ req/min y lo supera en segundos |
+| MongoDB no arranca en bite-api | user_data de bite-mongo aún corriendo | El log `/tmp/user-data-api.log` muestra "MongoDB no lista aun" — esperar hasta ver "MongoDB lista!" |
+| `mongosh` falla con "command not found" | MongoDB no instaló correctamente | SSH a bite-mongo → `cat /tmp/user-data-mongo.log` → verificar que terminó con "[bite-mongo] Setup completo" |
 
 ---
 
@@ -246,8 +274,8 @@ Esto elimina las 3 EC2 y los 3 security groups. **No hay costos recurrentes** un
 
 ```
 .
-├── main.tf                  # Toda la infraestructura Terraform (EC2, SGs, user_data)
-├── outputs.tf               # IPs públicas y URL del endpoint
+├── main.tf                  # Infraestructura Terraform: 4 SGs + 4 EC2 con user_data embebido
+├── outputs.tf               # IPs públicas, SSH commands, URL del endpoint
 ├── README.md                # Este archivo
 └── jmeter/
     ├── test_plan.jmx        # Plan de prueba JMeter (4 thread groups, 5 min cada uno)

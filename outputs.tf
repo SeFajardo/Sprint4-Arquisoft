@@ -32,3 +32,13 @@ output "ssh_kong" {
   description = "Comando SSH para conectarse a Kong"
   value       = "ssh -i vockey.pem ubuntu@${aws_instance.kong.public_ip}"
 }
+
+output "mongo_public_ip" {
+  description = "IP publica de la EC2 con MongoDB (SSH)"
+  value       = aws_instance.mongo.public_ip
+}
+
+output "ssh_mongo" {
+  description = "Comando SSH para conectarse a MongoDB"
+  value       = "ssh -i vockey.pem ubuntu@${aws_instance.mongo.public_ip}"
+}
